@@ -1,0 +1,38 @@
+-- 1. 文件表
+CREATE TABLE IF NOT EXISTS user_file (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id              INTEGER,
+    original_file_name   TEXT,
+    local_file_name      TEXT,
+    file_size            INTEGER,
+    local_parent         TEXT,
+    local_path           TEXT,
+    hash                 TEXT,
+    state                INTEGER,
+    total_count          INTEGER
+);
+
+-- 2. 上传任务表
+CREATE TABLE IF NOT EXISTS upload_task (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id              INTEGER,
+    original_file_name   TEXT,
+    local_file_name      TEXT,
+    file_size            INTEGER,
+    local_parent         TEXT,
+    local_path           TEXT,
+    hash                 TEXT,
+    state                INTEGER,
+    total_count          INTEGER
+);
+
+-- 3. 分片表
+CREATE TABLE IF NOT EXISTS file_chunk (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id       INTEGER,
+    hash          TEXT,
+    chunk_index   INTEGER,
+    size          INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uni_task_id_chunk_index
+ON file_chunk(task_id, chunk_index);

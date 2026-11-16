@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <title>文件上传测试</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: Consolas, "Microsoft YaHei", sans-serif;
+            font-size: 14px;
+            color: rgba(0, 0, 0, .8);
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            height: 100vh;
+        }
+
+        h1 {
+            font-size: 18px;
+            font-weight: 500;
+        }
+
+        .bar {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 10px;
+        }
+
+        button {
+            height: 32px;
+            padding: 0 16px;
+            border: 1px solid rgba(0, 0, 0, .4);
+            border-radius: 5px;
+            background-color: #fff;
+            font-size: 14px;
+            cursor: pointer;
+        }
+
+        button:disabled {
+            color: rgba(0, 0, 0, .3);
+            border-color: rgba(0, 0, 0, .2);
+            cursor: not-allowed;
+        }
+
+        #log {
+            flex: 1;
+            overflow: auto;
+            padding: 10px;
+            border: 1px solid rgba(0, 0, 0, .2);
+            border-radius: 5px;
+            background-color: #fafafa;
+            font-size: 13px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .ok {
+            color: seagreen;
+        }
+
+        .fail {
+            color: crimson;
+        }
+
+        .info {
+            color: #555;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>文件上传测试</h1>
+    <div class="bar">
+        <input type="file" id="file">
+        <button id="start">开始上传</button>
+        <button id="pause">暂停</button>
+        <button id="resume">继续</button>
+        <button id="clear">清空日志</button>
+    </div>
+    <div id="log"></div>
+
+    <script>
+        // 一片 1MB，跟后端的 Main.CHUNK_SIZE 保持一致
+        const CHUNK_SIZE = 1024 * 1024
+        // 后端没有登录模块，用户 ID 固定为 1
+        const USER_ID = 1
+        // 补传最多来回几轮，避免后端异常时页面死循环
+        const MAX_MERGE_ROUND = 10
+
+        const logBox = document.querySelector('#log')
+        const fileInput = document.querySelector('#file')
+        const startBtn = document.querySelector('#start')
+        const pauseBtn = document.querySelector('#pause')
+        const resumeBtn = document.querySelector('#resume')
+        const clearBtn = document.querySelector('#clear')
+
+        // 暂停标记、任务进行中标记
+        let paused = false
+        let running = false
+        // 当前任务（页面刷新后就没了，所以刷新后继续不了）
+        let currentTask = null
+        // 点暂停时直接中断分片上传、总hash计算
+        let controller = null
+
+        startBtn.addEventListener('click', async () => {
+            const file = fileInput.files[0]
+            if (!file) {
+                log('请先选择文件', 'fail')
+                return
+            }
+            await guard(async () => {
+                await uploadOne(file)
+            })
+        })
+
+        pauseBtn.addEventListener('click', () => {
+            if (!running) {
+                log('当前没有进行中的上传', 'info')
+                return
+            }
+            paused = true
+            // 立刻掐断正在传输的那个分片请求，不等它传完
+            if (controller) {
+                controller.abort()
+            }
+            log('已暂停（进行中的分片请求或 hash 计算已中断）', 'info')
+        })
+
+        resumeBtn.addEventListener('click', () => {
+            resumeUpload().catch((e) => log(`继续上传出错：${e.message}`, 'fail'))
+        })
+
+        clearBtn.addEventListener('click', () => {
+            logBox.innerHTML = ''
+        })
+
+        /**
+         * 包一层：控制按钮状态和暂停标记
+         * @param {Function} fn
+         */
+        async function guard(fn) {
+            if (running) {
+                log('已有任务在执行，等它结束或先暂停', 'fail')
+                return
+            }
+            running = true
+            paused = false
+            controller = new AbortController()
+            startBtn.disabled = true
+            resumeBtn.disabled = true
+            try {
+                await fn()
+            } catch (e) {
+                if (e.name === 'AbortError') {
+                    log('已暂停，点「继续」可接着传', 'info')
+                } else {
+                    log(`中断：${e.message}`, 'fail')
+                }
+            } finally {
+                running = false
+                controller = null
+                startBtn.disabled = false
+                resumeBtn.disabled = false
+            }
+        }
+
+        /**
+         * 「开始上传」：新建任务 -> 逐片全传 -> 合并
+         * @param {File} file
+         */
+        async function uploadOne(file) {
+            log(`========== ${file.name}（${file.size} 字节）==========`, 'info')
+
+            const taskJson = await postJson('/newTask', {
+                userId: USER_ID,
+                originalFileName: file.name,
+                fileSize: file.size
+            })
+            if (taskJson.state !== 1) {
+                log(`newTask 失败：${taskJson.msg}`, 'fail')
+                return
+            }
+            const task = taskJson.data
+            const taskId = task.id
+            currentTask = {
+                id: task.id,
+                fileName: file.name,
+                fileSize: file.size,
+                totalCount: task.totalCount
+            }
+            log(`newTask 成功，taskId=${taskId}，分片数=${task.totalCount}`, 'ok')
+
+            // chunkIndex 从 1 开始，全传
+            const indexes = []
+            for (let i = 1; i <= task.totalCount; i++) {
+                indexes.push(i)
+            }
+
+            const done = await uploadChunks(file, taskId, indexes)
+            if (!done) {
+                log(`已暂停，taskId=${taskId}，点「继续」会先问后端缺哪些片再补传`, 'info')
+                return
+            }
+            await mergeUntilDone(file, taskId)
+        }
+
+        /**
+         * 「继续」：走 /keep 问出缺失分片 -> 只补这些 -> 合并
+         */
+        async function resumeUpload() {
+            if (!currentTask) {
+                log('没有可继续的任务，先点「开始上传」建一个', 'fail')
+                return
+            }
+            const file = fileInput.files[0]
+            if (!file) {
+                log('继续需要先选择同一个文件（分片要从本地文件里切）', 'fail')
+                return
+            }
+            if (file.name !== currentTask.fileName || file.size !== currentTask.fileSize) {
+                log(`选中的文件和任务 ${currentTask.id} 不匹配，任务需要的是 ${currentTask.fileName}（${currentTask.fileSize} 字节）`, 'fail')
+                return
+            }
+            await guard(async () => {
+                const taskId = currentTask.id
+                log(`========== 继续上传 ${file.name}，taskId=${taskId} ==========`, 'info')
+
+                const keepJson = await postKeep(taskId)
+                if (keepJson.state !== 1) {
+                    log(`keep 失败：${keepJson.msg}`, 'fail')
+                    return
+                }
+                const missList = keepJson.data
+                if (missList.length === 0) {
+                    log('keep 返回空，没有缺失分片，直接合并', 'ok')
+                } else {
+                    log(`keep 返回缺失分片：${missList.join(',')}`, 'ok')
+                }
+
+                const done = await uploadChunks(file, taskId, missList)
+                if (!done) {
+                    log(`再次暂停，taskId=${taskId}，点「继续」可再来一次`, 'info')
+                    return
+                }
+                await mergeUntilDone(file, taskId)
+            })
+        }
+
+        /**
+         * 按给定序号上传分片
+         * @param {File} file
+         * @param {number|string} taskId
+         * @param {number[]} indexes 分片序号（从 1 开始）
+         * @returns {Promise<boolean>} true 表示全部传完，false 表示被暂停
+         */
+        async function uploadChunks(file, taskId, indexes) {
+            for (let i = 0; i < indexes.length; i++) {
+                if (paused) {
+                    return false
+                }
+                const index = indexes[i]
+                const start = (index - 1) * CHUNK_SIZE
+                const chunk = file.slice(start, Math.min(start + CHUNK_SIZE, file.size))
+                const bytes = await chunk.arrayBuffer()
+                const hash = await sha256Hex(bytes)
+
+                const form = new FormData()
+                form.append('file', new Blob([bytes]), `chunk-${index}`)
+                form.append('hash', hash)
+                form.append('taskId', taskId)
+                form.append('chunkIndex', index)
+
+                let json
+                try {
+                    json = await postUpload(form, controller.signal)
+                } catch (e) {
+                    // 点暂停时用 abort 掐断了这个请求，属于正常中断
+                    if (e.name === 'AbortError') {
+                        log(`分片 ${index} 请求已中断`, 'info')
+                        return false
+                    }
+                    throw e
+                }
+                if (json.state !== 1) {
+                    log(`分片 ${index} 上传失败：${json.msg}`, 'fail')
+                    return false
+                }
+                log(`分片 ${index} 上传成功（${i + 1}/${indexes.length}），大小=${chunk.size}，hash=${hash}`, 'ok')
+            }
+            return true
+        }
+
+        /**
+         * 一直合并到成功：merge 返回缺失分片就补传，再 merge，直到 missList 为空
+         * hash 只算一次（整个文件的 SHA-256），不用每轮重复算
+         * @param {File} file
+         * @param {number|string} taskId
+         */
+        async function mergeUntilDone(file, taskId) {
+            log('分片已齐，开始计算整文件 hash……', 'info')
+            // 暂停时这个 signal 会 terminate 掉 worker，抛 AbortError 出去
+            const fileHash = await sha256HexOfFile(file, controller.signal)
+            log(`整文件 hash=${fileHash}`, 'ok')
+            // hash 是循环外算的，后面补传多少轮都复用这一个值，不再重算
+            // 防止后端一直返回同样的 missList 时页面无限请求
+            for (let round = 1; round <= MAX_MERGE_ROUND; round++) {
+                const json = await postJson('/merge', { hash: fileHash, taskId: taskId })
+                if (json.state !== 1) {
+                    log(`merge 失败：${json.msg}`, 'fail')
+                    return
+                }
+                const missList = json.data.missList
+                if (!missList || missList.length === 0) {
+                    log(`merge 成功（第 ${round} 轮），fileId=${json.data.fileId}，文件 hash=${fileHash}`, 'ok')
+                    // 任务完成了，再点「继续」就没意义，清掉
+                    currentTask = null
+                    return
+                }
+                log(`merge 返回缺失分片：${missList.join(',')}，补传后再次合并`, 'info')
+                const done = await uploadChunks(file, taskId, missList)
+                if (!done) {
+                    log(`补传中途暂停，taskId=${taskId}，点「继续」可再来一次`, 'info')
+                    return
+                }
+            }
+            log(`连续 ${MAX_MERGE_ROUND} 轮 merge 都返回缺失分片，停止重试`, 'fail')
+        }
+
+        /**
+         * 发送 JSON 请求
+         * @param {string} url
+         * @param {object} body
+         * @returns {Promise<object>}
+         */
+        async function postJson(url, body) {
+            log(`POST ${url} ${JSON.stringify(body)}`, 'info')
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            })
+            return readJson(response)
+        }
+
+        /**
+         * 发送分片上传请求，body 一定是 FormData
+         * @param {FormData} form
+         * @param {AbortSignal} signal 暂停时用来中断
+         * @returns {Promise<object>}
+         */
+        async function postUpload(form, signal) {
+            log('POST /upload [FormData]', 'info')
+            // 从发送请求到响应完全返回，再到body读取完成之前，都可以中断
+            const response = await fetch('/upload', { method: 'POST', body: form, signal: signal })
+            return readJson(response)
+        }
+
+        /**
+         * 问后端这个任务还缺哪些分片，参数用 application/x-www-form-urlencoded
+         * @param {number|string} taskId
+         * @returns {Promise<object>}
+         */
+        async function postKeep(taskId) {
+            log(`POST /keep taskId=${taskId}`, 'info')
+            const response = await fetch('/keep', {
+                method: 'POST',
+                body: new URLSearchParams({ taskId: String(taskId) })
+            })
+            return readJson(response)
+        }
+
+        /**
+         * 读响应体并打印状态码
+         * @param {Response} response
+         * @returns {Promise<object>}
+         */
+        async function readJson(response) {
+            const text = await response.text()
+            if (!response.ok) {
+                log(`HTTP ${response.status}：${text}`, 'fail')
+                return { state: 0, msg: `HTTP ${response.status}` }
+            }
+            log(`响应：${text}`, 'info')
+            return JSON.parse(text)
+        }
+
+        /**
+         * 计算 SHA-256，返回小写十六进制字符串（只给 1MB 分片用）
+         * @param {ArrayBuffer} bytes
+         * @returns {Promise<string>}
+         */
+        async function sha256Hex(bytes) {
+            const digest = await crypto.subtle.digest('SHA-256', bytes)
+            return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('')
+        }
+
+        /**
+         * 在 worker 里把整个文件读一遍算 SHA-256
+         * 内存占用恒定（worker 里按 4MB 边读边算），大文件不会把主线程的内存撑爆
+         * 传入 signal 后可以中断：暂停时直接 terminate 掉 worker，已算的部分丢弃
+         * @param {File} file
+         * @param {AbortSignal} [signal]
+         * @returns {Promise<string>} 小写十六进制
+         */
+        function sha256HexOfFile(file, signal) {
+            return new Promise((resolve, reject) => {
+                const worker = new Worker('worker.js')
+                // 日志最多每 20% 打一条，免得刷屏
+                let logged = -1
+                // 只允许结束一次，避免 abort 之后 done 又回来
+                let settled = false
+
+                const close = () => {
+                    if (signal) {
+                        signal.removeEventListener('abort', onAbort)
+                    }
+                    worker.terminate()
+                }
+                const succeed = (hash) => {
+                    if (settled) {
+                        return
+                    }
+                    settled = true
+                    close()
+                    resolve(hash)
+                }
+                const fail = (err) => {
+                    if (settled) {
+                        return
+                    }
+                    settled = true
+                    close()
+                    reject(err)
+                }
+                const onAbort = () => {
+                    const err = new Error('已暂停')
+                    err.name = 'AbortError'
+                    fail(err)
+                }
+
+                worker.onmessage = (e) => {
+                    const msg = e.data
+                    if (msg.type === 'progress') {
+                        const percent = Math.floor(msg.loaded / msg.total * 5) * 20
+                        if (percent > logged) {
+                            logged = percent
+                            log(`后台算 hash：${percent}%`, 'info')
+                        }
+                    } else if (msg.type === 'done') {
+                        succeed(msg.hash)
+                    } else {
+                        fail(new Error(msg.message || '计算 hash 失败'))
+                    }
+                }
+                worker.onerror = (e) => {
+                    fail(new Error(e.message || 'worker.js 加载失败'))
+                }
+
+                if (signal) {
+                    if (signal.aborted) {
+                        onAbort()
+                        return
+                    }
+                    signal.addEventListener('abort', onAbort)
+                }
+                worker.postMessage({ type: 'hash-file', file: file })
+            })
+        }
+
+        /**
+         * 往日志面板追加一行
+         * @param {string} text
+         * @param {string} level  ok / fail / info
+         */
+        function log(text, level = 'info') {
+            const div = document.createElement('div')
+            div.className = level
+            const time = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+            div.textContent = `[${time}] ${text}`
+            logBox.appendChild(div)
+            logBox.scrollTop = logBox.scrollHeight
+        }
+    </script>
+</body>
+
+</html>
